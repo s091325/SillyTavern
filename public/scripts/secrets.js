@@ -16,6 +16,7 @@ export const SECRET_KEYS = {
     AI21: 'api_key_ai21',
     SCALE_COOKIE: 'scale_cookie',
     MAKERSUITE: 'api_key_makersuite',
+    VERTEXAI: 'api_key_vertexai',
     SERPAPI: 'api_key_serpapi',
     MISTRALAI: 'api_key_mistralai',
     TOGETHERAI: 'api_key_togetherai',
@@ -43,6 +44,7 @@ export const SECRET_KEYS = {
     SERPER: 'api_key_serper',
     FALAI: 'api_key_falai',
     XAI: 'api_key_xai',
+    VERTEXAI_SERVICE_ACCOUNT: 'vertexai_service_account_json',
 };
 
 const INPUT_MAP = {
@@ -56,6 +58,7 @@ const INPUT_MAP = {
     [SECRET_KEYS.AI21]: '#api_key_ai21',
     [SECRET_KEYS.SCALE_COOKIE]: '#scale_cookie',
     [SECRET_KEYS.MAKERSUITE]: '#api_key_makersuite',
+    [SECRET_KEYS.VERTEXAI]: '#api_key_vertexai',
     [SECRET_KEYS.VLLM]: '#api_key_vllm',
     [SECRET_KEYS.APHRODITE]: '#api_key_aphrodite',
     [SECRET_KEYS.TABBY]: '#api_key_tabby',
@@ -78,7 +81,12 @@ const INPUT_MAP = {
     [SECRET_KEYS.GENERIC]: '#api_key_generic',
     [SECRET_KEYS.DEEPSEEK]: '#api_key_deepseek',
     [SECRET_KEYS.XAI]: '#api_key_xai',
+    [SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT]: '#vertexai_service_account_json',
 };
+
+const STATIC_PLACEHOLDER_KEYS = [
+    SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT,
+];
 
 async function clearSecret() {
     const key = $(this).data('key');
@@ -91,6 +99,9 @@ async function clearSecret() {
 
 export function updateSecretDisplay() {
     for (const [secret_key, input_selector] of Object.entries(INPUT_MAP)) {
+        if (STATIC_PLACEHOLDER_KEYS.includes(secret_key)) {
+            continue;
+        }
         const validSecret = !!secret_state[secret_key];
 
         const placeholder = $('#viewSecrets').attr(validSecret ? 'key_saved_text' : 'missing_key_text');

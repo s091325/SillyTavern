@@ -407,6 +407,10 @@ export function getTokenizerModel(requestModel) {
         return 'o1';
     }
 
+    if (requestModel.includes('o3') || requestModel.includes('o4-mini')) {
+        return 'o1';
+    }
+
     if (requestModel.includes('gpt-4o') || requestModel.includes('chatgpt-4o-latest')) {
         return 'gpt-4o';
     }
@@ -459,7 +463,7 @@ export function getTokenizerModel(requestModel) {
         return 'deepseek';
     }
 
-    if (requestModel.includes('gemma') || requestModel.includes('gemini')) {
+    if (requestModel.includes('gemma') || requestModel.includes('gemini') || requestModel.includes('learnlm')) {
         return 'gemma';
     }
 

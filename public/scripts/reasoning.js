@@ -114,6 +114,7 @@ export function extractReasoningFromData(data, {
                 case chat_completion_sources.OPENROUTER:
                     return data?.choices?.[0]?.message?.reasoning ?? '';
                 case chat_completion_sources.MAKERSUITE:
+                case chat_completion_sources.VERTEXAI:
                     return data?.responseContent?.parts?.filter(part => part.thought)?.map(part => part.text)?.join('\n\n') ?? '';
                 case chat_completion_sources.CLAUDE:
                     return data?.content?.find(part => part.type === 'thinking')?.thinking ?? '';
@@ -425,7 +426,7 @@ export class ReasoningHandler {
         if (!this.#isParsingReasoning)
             return mesChanged;
 
-        // If we are in manual parsing mode, all currently streaming mes tokens will go the the reasoning block
+        // If we are in manual parsing mode, all currently streaming mes tokens will go to the reasoning block
         this.reasoning = parseTarget.slice(power_user.reasoning.prefix.length);
         message.mes = '';
 

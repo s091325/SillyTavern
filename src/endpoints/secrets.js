@@ -26,6 +26,7 @@ export const SECRET_KEYS = {
     ONERING_URL: 'oneringtranslator_url',
     DEEPLX_URL: 'deeplx_url',
     MAKERSUITE: 'api_key_makersuite',
+    VERTEXAI: 'api_key_vertexai',
     SERPAPI: 'api_key_serpapi',
     TOGETHERAI: 'api_key_togetherai',
     MISTRALAI: 'api_key_mistralai',
@@ -53,6 +54,7 @@ export const SECRET_KEYS = {
     DEEPSEEK: 'api_key_deepseek',
     SERPER: 'api_key_serper',
     XAI: 'api_key_xai',
+    VERTEXAI_SERVICE_ACCOUNT: 'vertexai_service_account_json',
 };
 
 // These are the keys that are safe to expose, even if allowKeysExposure is false
