@@ -168,6 +168,7 @@ export const CHAT_COMPLETION_SOURCES = {
     OPENROUTER: 'openrouter',
     AI21: 'ai21',
     MAKERSUITE: 'makersuite',
+    VERTEXAI: 'vertexai',
     MISTRALAI: 'mistralai',
     CUSTOM: 'custom',
     COHERE: 'cohere',
@@ -176,6 +177,7 @@ export const CHAT_COMPLETION_SOURCES = {
     ZEROONEAI: '01ai',
     NANOGPT: 'nanogpt',
     DEEPSEEK: 'deepseek',
+    AIMLAPI: 'aimlapi',
     XAI: 'xai',
     POLLINATIONS: 'pollinations',
 };
@@ -327,8 +329,14 @@ export const OPENAI_KEYS = [
 
 export const AVATAR_WIDTH = 512;
 export const AVATAR_HEIGHT = 768;
+export const DEFAULT_AVATAR_PATH = './public/img/ai4.png';
 
 export const OPENROUTER_HEADERS = {
+    'HTTP-Referer': 'https://sillytavern.app',
+    'X-Title': 'SillyTavern',
+};
+
+export const AIMLAPI_HEADERS = {
     'HTTP-Referer': 'https://sillytavern.app',
     'X-Title': 'SillyTavern',
 };

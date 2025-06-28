@@ -4,6 +4,7 @@ import express from 'express';
 import fetch from 'node-fetch';
 
 import {
+    AIMLAPI_HEADERS,
     CHAT_COMPLETION_SOURCES,
     GEMINI_SAFETY,
     OPENROUTER_HEADERS,
@@ -16,6 +17,7 @@ import {
     mergeObjectWithYaml,
     excludeKeysByYaml,
     color,
+    trimTrailingSlash,
 } from '../../util.js';
 import {
     convertClaudeMessages,
@@ -25,12 +27,14 @@ import {
     convertMistralMessages,
     convertAI21Messages,
     convertXAIMessages,
-    mergeMessages,
     cachingAtDepthForOpenRouterClaude,
     cachingAtDepthForClaude,
     getPromptNames,
     calculateClaudeBudgetTokens,
     calculateGoogleBudgetTokens,
+    postProcessPrompt,
+    PROMPT_PROCESSING_TYPE,
+    addAssistantPrefix,
 } from '../../prompt-converters.js';
 
 import { readSecret, SECRET_KEYS } from '../secrets.js';
@@ -43,6 +47,7 @@ import {
     webTokenizers,
     getWebTokenizer,
 } from '../tokenizers.js';
+import { getVertexAIAuth, getProjectIdFromServiceAccount } from '../google.js';
 
 const API_OPENAI = 'https://api.openai.com/v1';
 const API_CLAUDE = 'https://api.anthropic.com/v1';
@@ -52,38 +57,14 @@ const API_COHERE_V2 = 'https://api.cohere.ai/v2';
 const API_PERPLEXITY = 'https://api.perplexity.ai';
 const API_GROQ = 'https://api.groq.com/openai/v1';
 const API_MAKERSUITE = 'https://generativelanguage.googleapis.com';
+const API_VERTEX_AI = 'https://us-central1-aiplatform.googleapis.com';
 const API_01AI = 'https://api.lingyiwanwu.com/v1';
 const API_AI21 = 'https://api.ai21.com/studio/v1';
 const API_NANOGPT = 'https://nano-gpt.com/api/v1';
 const API_DEEPSEEK = 'https://api.deepseek.com/beta';
 const API_XAI = 'https://api.x.ai/v1';
+const API_AIMLAPI = 'https://api.aimlapi.com/v1';
 const API_POLLINATIONS = 'https://text.pollinations.ai/openai';
-
-/**
- * Applies a post-processing step to the generated messages.
- * @param {object[]} messages Messages to post-process
- * @param {string} type Prompt conversion type
- * @param {import('../../prompt-converters.js').PromptNames} names Prompt names
- * @returns
- */
-function postProcessPrompt(messages, type, names) {
-    const addAssistantPrefix = x => x.length && (x[x.length - 1].role !== 'assistant' || (x[x.length - 1].prefix = true)) ? x : x;
-    switch (type) {
-        case 'merge':
-        case 'claude':
-            return mergeMessages(messages, names, false, false);
-        case 'semi':
-            return mergeMessages(messages, names, true, false);
-        case 'strict':
-            return mergeMessages(messages, names, true, true);
-        case 'deepseek':
-            return addAssistantPrefix(mergeMessages(messages, names, true, false));
-        case 'deepseek-reasoner':
-            return addAssistantPrefix(mergeMessages(messages, names, true, true));
-        default:
-            return messages;
-    }
-}
 
 /**
  * Gets OpenRouter transforms based on the request.
@@ -125,10 +106,11 @@ async function sendClaudeRequest(request, response) {
     const apiUrl = new URL(request.body.reverse_proxy || API_CLAUDE).toString();
     const apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.CLAUDE);
     const divider = '-'.repeat(process.stdout.columns);
-    const enableSystemPromptCache = getConfigValue('claude.enableSystemPromptCache', false, 'boolean') && request.body.model.startsWith('claude-3');
+    const isClaude3or4 = /^claude-(3|opus-4|sonnet-4)/.test(request.body.model);
+    const enableSystemPromptCache = getConfigValue('claude.enableSystemPromptCache', false, 'boolean') && isClaude3or4;
     let cachingAtDepth = getConfigValue('claude.cachingAtDepth', -1, 'number');
     // Disabled if not an integer or negative, or if the model doesn't support it
-    if (!Number.isInteger(cachingAtDepth) || cachingAtDepth < 0 || !request.body.model.startsWith('claude-3')) {
+    if (!Number.isInteger(cachingAtDepth) || cachingAtDepth < 0 || !isClaude3or4) {
         cachingAtDepth = -1;
     }
 
@@ -145,11 +127,12 @@ async function sendClaudeRequest(request, response) {
         });
         const additionalHeaders = {};
         const betaHeaders = ['output-128k-2025-02-19'];
-        const useTools = request.body.model.startsWith('claude-3') && Array.isArray(request.body.tools) && request.body.tools.length > 0;
-        const useSystemPrompt = (request.body.model.startsWith('claude-2') || request.body.model.startsWith('claude-3')) && request.body.claude_use_sysprompt;
+        const useTools = isClaude3or4 && Array.isArray(request.body.tools) && request.body.tools.length > 0;
+        const useSystemPrompt = Boolean(request.body.claude_use_sysprompt);
         const convertedPrompt = convertClaudeMessages(request.body.messages, request.body.assistant_prefill, useSystemPrompt, useTools, getPromptNames(request));
-        const useThinking = request.body.model.startsWith('claude-3-7') && Boolean(request.body.include_reasoning);
-        const useWebSearch = /^claude-3-(5|7)/.test(request.body.model) && Boolean(request.body.enable_web_search);
+        const useThinking = /^claude-(3-7|opus-4|sonnet-4)/.test(request.body.model);
+        const useWebSearch = /^claude-(3-5|3-7|opus-4|sonnet-4)/.test(request.body.model) && Boolean(request.body.enable_web_search);
+        const cacheTTL = getConfigValue('claude.extendedTTL', false, 'boolean') ? '1h' : '5m';
         let fixThinkingPrefill = false;
         // Add custom stop sequences
         const stopSequences = [];
@@ -170,7 +153,7 @@ async function sendClaudeRequest(request, response) {
         };
         if (useSystemPrompt) {
             if (enableSystemPromptCache && Array.isArray(convertedPrompt.systemPrompt) && convertedPrompt.systemPrompt.length) {
-                convertedPrompt.systemPrompt[convertedPrompt.systemPrompt.length - 1]['cache_control'] = { type: 'ephemeral' };
+                convertedPrompt.systemPrompt[convertedPrompt.systemPrompt.length - 1]['cache_control'] = { type: 'ephemeral', ttl: cacheTTL };
             }
 
             requestBody.system = convertedPrompt.systemPrompt;
@@ -186,7 +169,7 @@ async function sendClaudeRequest(request, response) {
                 .map(fn => ({ name: fn.name, description: fn.description, input_schema: fn.parameters }));
 
             if (enableSystemPromptCache && requestBody.tools.length) {
-                requestBody.tools[requestBody.tools.length - 1]['cache_control'] = { type: 'ephemeral' };
+                requestBody.tools[requestBody.tools.length - 1]['cache_control'] = { type: 'ephemeral', ttl: cacheTTL };
             }
         }
 
@@ -195,15 +178,16 @@ async function sendClaudeRequest(request, response) {
                 'type': 'web_search_20250305',
                 'name': 'web_search',
             }];
-            requestBody.tools = [...(requestBody.tools || []), ...webSearchTool];
+            requestBody.tools = [...webSearchTool, ...(requestBody.tools || [])];
         }
 
         if (cachingAtDepth !== -1) {
-            cachingAtDepthForClaude(convertedPrompt.messages, cachingAtDepth);
+            cachingAtDepthForClaude(convertedPrompt.messages, cachingAtDepth, cacheTTL);
         }
 
         if (enableSystemPromptCache || cachingAtDepth !== -1) {
             betaHeaders.push('prompt-caching-2024-07-31');
+            betaHeaders.push('extended-cache-ttl-2025-04-11');
         }
 
         const reasoningEffort = request.body.reasoning_effort;
@@ -337,12 +321,37 @@ async function sendScaleRequest(request, response) {
  * @param {express.Response} response Express response
  */
 async function sendMakerSuiteRequest(request, response) {
-    const apiUrl = new URL(request.body.reverse_proxy || API_MAKERSUITE);
-    const apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.MAKERSUITE);
+    const useVertexAi = request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.VERTEXAI;
+    const apiName = useVertexAi ? 'Google Vertex AI' : 'Google AI Studio';
+    let apiUrl;
+    let apiKey;
 
-    if (!request.body.reverse_proxy && !apiKey) {
-        console.warn('Google AI Studio API key is missing.');
-        return response.status(400).send({ error: true });
+    let authHeader;
+    let authType;
+
+    if (useVertexAi) {
+        apiUrl = new URL(request.body.reverse_proxy || API_VERTEX_AI);
+
+        try {
+            const auth = await getVertexAIAuth(request);
+            authHeader = auth.authHeader;
+            authType = auth.authType;
+            console.debug(`Using Vertex AI authentication type: ${authType}`);
+        } catch (error) {
+            console.warn(`${apiName} authentication failed: ${error.message}`);
+            return response.status(400).send({ error: true, message: error.message });
+        }
+    } else {
+        apiUrl = new URL(request.body.reverse_proxy || API_MAKERSUITE);
+        apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.MAKERSUITE);
+
+        if (!request.body.reverse_proxy && !apiKey) {
+            console.warn(`${apiName} API key is missing.`);
+            return response.status(400).send({ error: true });
+        }
+
+        authHeader = `Bearer ${apiKey}`;
+        authType = 'api_key';
     }
 
     const model = String(request.body.model);
@@ -367,9 +376,10 @@ async function sendMakerSuiteRequest(request, response) {
 
     function getGeminiBody() {
         // #region UGLY MODEL LISTS AREA
-        const imageGenerationModels =  [
+        const imageGenerationModels = [
             'gemini-2.0-flash-exp',
             'gemini-2.0-flash-exp-image-generation',
+            'gemini-2.0-flash-preview-image-generation',
         ];
 
         // These models do not support setting the threshold to OFF at all.
@@ -381,7 +391,6 @@ async function sendMakerSuiteRequest(request, response) {
         ];
 
         const isThinkingConfigModel = m => /^gemini-2.5-(flash|pro)/.test(m);
-        const isThinkingBudgetModel = m => /^gemini-2.5-flash/.test(m);
 
         const noSearchModels = [
             'gemini-2.0-flash-lite',
@@ -437,11 +446,15 @@ async function sendMakerSuiteRequest(request, response) {
         if (isThinkingConfigModel(model)) {
             const thinkingConfig = { includeThoughts: includeReasoning };
 
-            if (isThinkingBudgetModel(model)) {
-                const thinkingBudget = calculateGoogleBudgetTokens(generationConfig.maxOutputTokens, reasoningEffort);
-                if (Number.isInteger(thinkingBudget)) {
-                    thinkingConfig.thinkingBudget = thinkingBudget;
-                }
+            const thinkingBudget = calculateGoogleBudgetTokens(generationConfig.maxOutputTokens, reasoningEffort, model);
+            if (Number.isInteger(thinkingBudget)) {
+                thinkingConfig.thinkingBudget = thinkingBudget;
+            }
+
+            // Vertex doesn't allow mixing disabled thinking with includeThoughts
+            if (useVertexAi && thinkingBudget === 0 && thinkingConfig.includeThoughts) {
+                console.info('Thinking budget is 0, but includeThoughts is true. Thoughts will not be included in the response.');
+                thinkingConfig.includeThoughts = false;
             }
 
             generationConfig.thinkingConfig = thinkingConfig;
@@ -465,7 +478,7 @@ async function sendMakerSuiteRequest(request, response) {
     }
 
     const body = getGeminiBody();
-    console.debug('Google AI Studio request:', body);
+    console.debug(`${apiName} request:`, body);
 
     try {
         const controller = new AbortController();
@@ -477,12 +490,61 @@ async function sendMakerSuiteRequest(request, response) {
         const apiVersion = getConfigValue('gemini.apiVersion', 'v1beta');
         const responseType = (stream ? 'streamGenerateContent' : 'generateContent');
 
-        const generateResponse = await fetch(`${apiUrl.toString().replace(/\/$/, '')}/${apiVersion}/models/${model}:${responseType}?key=${apiKey}${stream ? '&alt=sse' : ''}`, {
+        let url;
+        let headers = {
+            'Content-Type': 'application/json',
+        };
+
+        if (useVertexAi) {
+            if (authType === 'express') {
+                // For Express mode (API key authentication), use the key parameter
+                const keyParam = authHeader.replace('Bearer ', '');
+                const region = request.body.vertexai_region || 'us-central1';
+                const projectId = request.body.vertexai_express_project_id;
+                const baseUrl = region === 'global'
+                    ? 'https://aiplatform.googleapis.com'
+                    : `https://${region}-aiplatform.googleapis.com`;
+                url = projectId
+                    ? `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:generateContent?key=${keyParam}${stream ? '&alt=sse' : ''}`
+                    : `${baseUrl}/v1/publishers/google/models/${model}:generateContent?key=${keyParam}${stream ? '&alt=sse' : ''}`;
+            } else if (authType === 'full') {
+                // For Full mode (service account authentication), use project-specific URL
+                // Get project ID from Service Account JSON
+                const serviceAccountJson = readSecret(request.user.directories, SECRET_KEYS.VERTEXAI_SERVICE_ACCOUNT);
+                if (!serviceAccountJson) {
+                    console.warn('Vertex AI Service Account JSON is missing.');
+                    return response.status(400).send({ error: true });
+                }
+
+                let projectId;
+                try {
+                    const serviceAccount = JSON.parse(serviceAccountJson);
+                    projectId = getProjectIdFromServiceAccount(serviceAccount);
+                } catch (error) {
+                    console.error('Failed to extract project ID from Service Account JSON:', error);
+                    return response.status(400).send({ error: true });
+                }
+                const region = request.body.vertexai_region || 'us-central1';
+                // Handle global region differently - no region prefix in hostname
+                if (region === 'global') {
+                    url = `https://aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:${responseType}${stream ? '?alt=sse' : ''}`;
+                } else {
+                    url = `https://${region}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${region}/publishers/google/models/${model}:${responseType}${stream ? '?alt=sse' : ''}`;
+                }
+                headers['Authorization'] = authHeader;
+            } else {
+                // For proxy mode, use the original URL with Authorization header
+                url = `${apiUrl.toString().replace(/\/$/, '')}/v1/publishers/google/models/${model}:${responseType}${stream ? '?alt=sse' : ''}`;
+                headers['Authorization'] = authHeader;
+            }
+        } else {
+            url = `${apiUrl.toString().replace(/\/$/, '')}/${apiVersion}/models/${model}:${responseType}?key=${apiKey}${stream ? '&alt=sse' : ''}`;
+        }
+
+        const generateResponse = await fetch(url, {
             body: JSON.stringify(body),
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
+            headers: headers,
             signal: controller.signal,
         });
 
@@ -498,7 +560,7 @@ async function sendMakerSuiteRequest(request, response) {
             }
         } else {
             if (!generateResponse.ok) {
-                console.warn(`Google AI Studio API returned error: ${generateResponse.status} ${generateResponse.statusText} ${await generateResponse.text()}`);
+                console.warn(`${apiName} API returned error: ${generateResponse.status} ${generateResponse.statusText} ${await generateResponse.text()}`);
                 return response.status(500).send({ error: true });
             }
 
@@ -507,7 +569,7 @@ async function sendMakerSuiteRequest(request, response) {
 
             const candidates = generateResponseJson?.candidates;
             if (!candidates || candidates.length === 0) {
-                let message = 'Google AI Studio API returned no candidate';
+                let message = `${apiName} API returned no candidate`;
                 console.warn(message, generateResponseJson);
                 if (generateResponseJson?.promptFeedback?.blockReason) {
                     message += `\nPrompt was blocked due to : ${generateResponseJson.promptFeedback.blockReason}`;
@@ -518,11 +580,11 @@ async function sendMakerSuiteRequest(request, response) {
             const responseContent = candidates[0].content ?? candidates[0].output;
             const functionCall = (candidates?.[0]?.content?.parts ?? []).some(part => part.functionCall);
             const inlineData = (candidates?.[0]?.content?.parts ?? []).some(part => part.inlineData);
-            console.debug('Google AI Studio response:', util.inspect(generateResponseJson, { depth: 5, colors: true }));
+            console.debug(`${apiName} response:`, util.inspect(generateResponseJson, { depth: 5, colors: true }));
 
             const responseText = typeof responseContent === 'string' ? responseContent : responseContent?.parts?.filter(part => !part.thought)?.map(part => part.text)?.join('\n\n');
             if (!responseText && !functionCall && !inlineData) {
-                let message = 'Google AI Studio Candidate text empty';
+                let message = `${apiName} Candidate text empty`;
                 console.warn(message, generateResponseJson);
                 return response.send({ error: { message } });
             }
@@ -532,7 +594,7 @@ async function sendMakerSuiteRequest(request, response) {
             return response.send(reply);
         }
     } catch (error) {
-        console.error('Error communicating with Google AI Studio API: ', error);
+        console.error(`Error communicating with ${apiName} API:`, error);
         if (!response.headersSent) {
             return response.status(500).send({ error: true });
         }
@@ -820,8 +882,10 @@ async function sendDeepSeekRequest(request, response) {
             });
         }
 
-        const postProcessType = String(request.body.model).endsWith('-reasoner') ? 'deepseek-reasoner' : 'deepseek';
-        const processedMessages = postProcessPrompt(request.body.messages, postProcessType, getPromptNames(request));
+        const postProcessType = String(request.body.model).endsWith('-reasoner')
+            ? PROMPT_PROCESSING_TYPE.STRICT_TOOLS
+            : PROMPT_PROCESSING_TYPE.SEMI_TOOLS;
+        const processedMessages = addAssistantPrefix(postProcessPrompt(request.body.messages, postProcessType, getPromptNames(request)), bodyParams.tools);
 
         const requestBody = {
             'messages': processedMessages,
@@ -915,6 +979,17 @@ async function sendXaiRequest(request, response) {
             bodyParams['reasoning_effort'] = request.body.reasoning_effort === 'high' ? 'high' : 'low';
         }
 
+        if (request.body.enable_web_search) {
+            bodyParams['search_parameters'] = {
+                mode: 'on',
+                sources: [
+                    { type: 'web', safe_search: false },
+                    { type: 'news', safe_search: false },
+                    { type: 'x' },
+                ],
+            };
+        }
+
         const processedMessages = request.body.messages = convertXAIMessages(request.body.messages, getPromptNames(request));
 
         const requestBody = {
@@ -969,72 +1044,205 @@ async function sendXaiRequest(request, response) {
     }
 }
 
+/**
+ * Sends a request to AI/ML API.
+ * @param {express.Request} request Express request
+ * @param {express.Response} response Express response
+ */
+async function sendAimlapiRequest(request, response) {
+    const apiUrl = API_AIMLAPI;
+    const apiKey = readSecret(request.user.directories, SECRET_KEYS.AIMLAPI);
+
+    if (!apiKey) {
+        console.warn('AI/ML API key is missing.');
+        return response.status(400).send({ error: true });
+    }
+
+    const controller = new AbortController();
+    request.socket.removeAllListeners('close');
+    request.socket.on('close', function () {
+        controller.abort();
+    });
+
+    try {
+        let bodyParams = {};
+
+        if (request.body.logprobs > 0) {
+            bodyParams['top_logprobs'] = request.body.logprobs;
+            bodyParams['logprobs'] = true;
+        }
+
+        if (Array.isArray(request.body.tools) && request.body.tools.length > 0) {
+            bodyParams['tools'] = request.body.tools;
+            bodyParams['tool_choice'] = request.body.tool_choice;
+        }
+
+        if (Array.isArray(request.body.stop) && request.body.stop.length > 0) {
+            bodyParams['stop'] = request.body.stop;
+        }
+
+        if (request.body.reasoning_effort) {
+            bodyParams['reasoning_effort'] = request.body.reasoning_effort;
+        }
+
+        const requestBody = {
+            'messages': request.body.messages,
+            'model': request.body.model,
+            'temperature': request.body.temperature,
+            'max_tokens': request.body.max_tokens,
+            'stream': request.body.stream,
+            'presence_penalty': request.body.presence_penalty,
+            'frequency_penalty': request.body.frequency_penalty,
+            'top_p': request.body.top_p,
+            'seed': request.body.seed,
+            'n': request.body.n,
+            ...bodyParams,
+        };
+
+        const config = {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + apiKey,
+                ...AIMLAPI_HEADERS,
+            },
+            body: JSON.stringify(requestBody),
+            signal: controller.signal,
+        };
+
+        console.debug('AI/ML API request:', requestBody);
+
+        const generateResponse = await fetch(apiUrl + '/chat/completions', config);
+
+        if (request.body.stream) {
+            forwardFetchResponse(generateResponse, response);
+        } else {
+            if (!generateResponse.ok) {
+                const errorText = await generateResponse.text();
+                console.warn(`AI/ML API returned error: ${generateResponse.status} ${generateResponse.statusText} ${errorText}`);
+                const errorJson = tryParse(errorText) ?? { error: true };
+                return response.status(500).send(errorJson);
+            }
+            const generateResponseJson = await generateResponse.json();
+            console.debug('AI/ML API response:', generateResponseJson);
+            return response.send(generateResponseJson);
+        }
+    } catch (error) {
+        console.error('Error communicating with AI/ML API: ', error);
+        if (!response.headersSent) {
+            response.send({ error: true });
+        } else {
+            response.end();
+        }
+    }
+}
+
 export const router = express.Router();
 
-router.post('/status', async function (request, response_getstatus_openai) {
-    if (!request.body) return response_getstatus_openai.sendStatus(400);
+router.post('/status', async function (request, statusResponse) {
+    if (!request.body) return statusResponse.sendStatus(400);
 
-    let api_url;
-    let api_key_openai;
+    let apiUrl;
+    let apiKey;
     let headers;
 
     if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.OPENAI) {
-        api_url = new URL(request.body.reverse_proxy || API_OPENAI).toString();
-        api_key_openai = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.OPENAI);
+        apiUrl = new URL(request.body.reverse_proxy || API_OPENAI).toString();
+        apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.OPENAI);
         headers = {};
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.OPENROUTER) {
-        api_url = 'https://openrouter.ai/api/v1';
-        api_key_openai = readSecret(request.user.directories, SECRET_KEYS.OPENROUTER);
+        apiUrl = 'https://openrouter.ai/api/v1';
+        apiKey = readSecret(request.user.directories, SECRET_KEYS.OPENROUTER);
         // OpenRouter needs to pass the Referer and X-Title: https://openrouter.ai/docs#requests
         headers = { ...OPENROUTER_HEADERS };
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.MISTRALAI) {
-        api_url = new URL(request.body.reverse_proxy || API_MISTRAL).toString();
-        api_key_openai = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.MISTRALAI);
+        apiUrl = new URL(request.body.reverse_proxy || API_MISTRAL).toString();
+        apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.MISTRALAI);
         headers = {};
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.CUSTOM) {
-        api_url = request.body.custom_url;
-        api_key_openai = readSecret(request.user.directories, SECRET_KEYS.CUSTOM);
+        apiUrl = request.body.custom_url;
+        apiKey = readSecret(request.user.directories, SECRET_KEYS.CUSTOM);
         headers = {};
         mergeObjectWithYaml(headers, request.body.custom_include_headers);
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.COHERE) {
-        api_url = API_COHERE_V1;
-        api_key_openai = readSecret(request.user.directories, SECRET_KEYS.COHERE);
+        apiUrl = API_COHERE_V1;
+        apiKey = readSecret(request.user.directories, SECRET_KEYS.COHERE);
         headers = {};
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.ZEROONEAI) {
-        api_url = API_01AI;
-        api_key_openai = readSecret(request.user.directories, SECRET_KEYS.ZEROONEAI);
+        apiUrl = API_01AI;
+        apiKey = readSecret(request.user.directories, SECRET_KEYS.ZEROONEAI);
         headers = {};
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.NANOGPT) {
-        api_url = API_NANOGPT;
-        api_key_openai = readSecret(request.user.directories, SECRET_KEYS.NANOGPT);
+        apiUrl = API_NANOGPT;
+        apiKey = readSecret(request.user.directories, SECRET_KEYS.NANOGPT);
         headers = {};
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.DEEPSEEK) {
-        api_url = new URL(request.body.reverse_proxy || API_DEEPSEEK.replace('/beta', ''));
-        api_key_openai = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.DEEPSEEK);
+        apiUrl = new URL(request.body.reverse_proxy || API_DEEPSEEK.replace('/beta', ''));
+        apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.DEEPSEEK);
         headers = {};
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.XAI) {
-        api_url = new URL(request.body.reverse_proxy || API_XAI);
-        api_key_openai = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.XAI);
+        apiUrl = new URL(request.body.reverse_proxy || API_XAI);
+        apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.XAI);
         headers = {};
+    } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.AIMLAPI) {
+        apiUrl = API_AIMLAPI;
+        apiKey = readSecret(request.user.directories, SECRET_KEYS.AIMLAPI);
+        headers = { ...AIMLAPI_HEADERS };
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.POLLINATIONS) {
-        api_url = 'https://text.pollinations.ai';
-        api_key_openai = 'NONE';
+        apiUrl = 'https://text.pollinations.ai';
+        apiKey = 'NONE';
         headers = {};
+    } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.MAKERSUITE) {
+        apiKey = request.body.reverse_proxy ? request.body.proxy_password : readSecret(request.user.directories, SECRET_KEYS.MAKERSUITE);
+        apiUrl = trimTrailingSlash(request.body.reverse_proxy || API_MAKERSUITE);
+        const apiVersion = getConfigValue('gemini.apiVersion', 'v1beta');
+        const modelsUrl = !apiKey && request.body.reverse_proxy
+            ? `${apiUrl}/${apiVersion}/models`
+            : `${apiUrl}/${apiVersion}/models?key=${apiKey}`;
+
+        if (!apiKey && !request.body.reverse_proxy) {
+            console.warn('Google AI Studio API key is missing.');
+            return statusResponse.status(400).send({ error: true });
+        }
+
+        try {
+            const response = await fetch(modelsUrl);
+
+            if (response.ok) {
+                /** @type {any} */
+                const data = await response.json();
+                // Transform Google AI Studio models to OpenAI format
+                const models = data.models
+                    ?.filter(model => model.supportedGenerationMethods?.includes('generateContent'))
+                    ?.map(model => ({
+                        id: model.name.replace('models/', ''),
+                    })) || [];
+
+                console.info('Available Google AI Studio models:', models.map(m => m.id));
+                return statusResponse.send({ data: models });
+            } else {
+                console.warn('Google AI Studio models endpoint failed:', response.status, response.statusText);
+                return statusResponse.send({ error: true, bypass: true, data: { data: [] } });
+            }
+        } catch (error) {
+            console.error('Error fetching Google AI Studio models:', error);
+            return statusResponse.send({ error: true, bypass: true, data: { data: [] } });
+        }
     } else {
         console.warn('This chat completion source is not supported yet.');
-        return response_getstatus_openai.status(400).send({ error: true });
+        return statusResponse.status(400).send({ error: true });
     }
 
-    if (!api_key_openai && !request.body.reverse_proxy && request.body.chat_completion_source !== CHAT_COMPLETION_SOURCES.CUSTOM) {
+    if (!apiKey && !request.body.reverse_proxy && request.body.chat_completion_source !== CHAT_COMPLETION_SOURCES.CUSTOM) {
         console.warn('Chat Completion API key is missing.');
-        return response_getstatus_openai.status(400).send({ error: true });
+        return statusResponse.status(400).send({ error: true });
     }
 
     try {
-        const response = await fetch(api_url + '/models', {
+        const response = await fetch(apiUrl + '/models', {
             method: 'GET',
             headers: {
-                'Authorization': 'Bearer ' + api_key_openai,
+                'Authorization': 'Bearer ' + apiKey,
                 ...headers,
             },
         });
@@ -1047,7 +1255,7 @@ router.post('/status', async function (request, response_getstatus_openai) {
                 data = { data: data.map(model => ({ id: model.name, ...model })) };
             }
 
-            response_getstatus_openai.send(data);
+            statusResponse.send(data);
 
             if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.COHERE && Array.isArray(data?.models)) {
                 data.data = data.models.map(model => ({ id: model.name, ...model }));
@@ -1083,15 +1291,15 @@ router.post('/status', async function (request, response_getstatus_openai) {
         }
         else {
             console.error('Chat Completion status check failed. Either Access Token is incorrect or API endpoint is down.');
-            response_getstatus_openai.send({ error: true, can_bypass: true, data: { data: [] } });
+            statusResponse.send({ error: true, data: { data: [] } });
         }
     } catch (e) {
         console.error(e);
 
-        if (!response_getstatus_openai.headersSent) {
-            response_getstatus_openai.send({ error: true });
+        if (!statusResponse.headersSent) {
+            statusResponse.send({ error: true });
         } else {
-            response_getstatus_openai.end();
+            statusResponse.end();
         }
     }
 });
@@ -1184,14 +1392,25 @@ router.post('/bias', async function (request, response) {
 router.post('/generate', function (request, response) {
     if (!request.body) return response.status(400).send({ error: true });
 
+    const postProcessingType = request.body.custom_prompt_post_processing;
+    if (Array.isArray(request.body.messages) && postProcessingType) {
+        console.info('Applying custom prompt post-processing of type', postProcessingType);
+        request.body.messages = postProcessPrompt(
+            request.body.messages,
+            postProcessingType,
+            getPromptNames(request));
+    }
+
     switch (request.body.chat_completion_source) {
         case CHAT_COMPLETION_SOURCES.CLAUDE: return sendClaudeRequest(request, response);
         case CHAT_COMPLETION_SOURCES.SCALE: return sendScaleRequest(request, response);
         case CHAT_COMPLETION_SOURCES.AI21: return sendAI21Request(request, response);
         case CHAT_COMPLETION_SOURCES.MAKERSUITE: return sendMakerSuiteRequest(request, response);
+        case CHAT_COMPLETION_SOURCES.VERTEXAI: return sendMakerSuiteRequest(request, response);
         case CHAT_COMPLETION_SOURCES.MISTRALAI: return sendMistralAIRequest(request, response);
         case CHAT_COMPLETION_SOURCES.COHERE: return sendCohereRequest(request, response);
         case CHAT_COMPLETION_SOURCES.DEEPSEEK: return sendDeepSeekRequest(request, response);
+        case CHAT_COMPLETION_SOURCES.AIMLAPI: return sendAimlapiRequest(request, response);
         case CHAT_COMPLETION_SOURCES.XAI: return sendXaiRequest(request, response);
     }
 
@@ -1200,15 +1419,6 @@ router.post('/generate', function (request, response) {
     let headers;
     let bodyParams;
     const isTextCompletion = Boolean(request.body.model && TEXT_COMPLETION_MODELS.includes(request.body.model)) || typeof request.body.messages === 'string';
-
-    const postProcessTypes = [CHAT_COMPLETION_SOURCES.CUSTOM, CHAT_COMPLETION_SOURCES.OPENROUTER];
-    if (Array.isArray(request.body.messages) && postProcessTypes.includes(request.body.chat_completion_source) && request.body.custom_prompt_post_processing) {
-        console.info('Applying custom prompt post-processing of type', request.body.custom_prompt_post_processing);
-        request.body.messages = postProcessPrompt(
-            request.body.messages,
-            request.body.custom_prompt_post_processing,
-            getPromptNames(request));
-    }
 
     if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.OPENAI) {
         apiUrl = new URL(request.body.reverse_proxy || API_OPENAI).toString();
@@ -1266,9 +1476,11 @@ router.post('/generate', function (request, response) {
             bodyParams['reasoning'] = { effort: request.body.reasoning_effort };
         }
 
-        let cachingAtDepth = getConfigValue('claude.cachingAtDepth', -1, 'number');
-        if (Number.isInteger(cachingAtDepth) && cachingAtDepth >= 0 && request.body.model?.startsWith('anthropic/claude-3')) {
-            cachingAtDepthForOpenRouterClaude(request.body.messages, cachingAtDepth);
+        const cachingAtDepth = getConfigValue('claude.cachingAtDepth', -1, 'number');
+        const isClaude3or4 = /anthropic\/claude-(3|opus-4|sonnet-4)/.test(request.body.model);
+        const cacheTTL = getConfigValue('claude.extendedTTL', false, 'boolean') ? '1h' : '5m';
+        if (Number.isInteger(cachingAtDepth) && cachingAtDepth >= 0 && isClaude3or4) {
+            cachingAtDepthForOpenRouterClaude(request.body.messages, cachingAtDepth, cacheTTL);
         }
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.CUSTOM) {
         apiUrl = request.body.custom_url;
@@ -1292,7 +1504,7 @@ router.post('/generate', function (request, response) {
         apiKey = readSecret(request.user.directories, SECRET_KEYS.PERPLEXITY);
         headers = {};
         bodyParams = {};
-        request.body.messages = postProcessPrompt(request.body.messages, 'strict', getPromptNames(request));
+        request.body.messages = postProcessPrompt(request.body.messages, PROMPT_PROCESSING_TYPE.STRICT, getPromptNames(request));
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.GROQ) {
         apiUrl = API_GROQ;
         apiKey = readSecret(request.user.directories, SECRET_KEYS.GROQ);
@@ -1311,10 +1523,14 @@ router.post('/generate', function (request, response) {
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.POLLINATIONS) {
         apiUrl = API_POLLINATIONS;
         apiKey = 'NONE';
-        headers = {};
+        headers = {
+            'Authorization': '',
+        };
         bodyParams = {
             reasoning_effort: request.body.reasoning_effort,
             private: true,
+            referrer: 'sillytavern',
+            seed: request.body.seed ?? Math.floor(Math.random() * 99999999),
         };
     } else {
         console.warn('This chat completion source is not supported yet.');
